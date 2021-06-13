@@ -3,10 +3,9 @@ import {View, FlatList} from 'react-native';
 // import Socket from 'socket.io-client';
 import { io } from "socket.io-client";
 import {
-    RTCView,
     RTCPeerConnection,
-    RTCIceCandidate,
     mediaDevices,
+    RTCSessionDescription,
 } from 'react-native-webrtc';
 import { v4 as uuid } from 'uuid';
 
@@ -14,15 +13,6 @@ import Participant from './participant';
 import WebrtcView from './webrtc-view';
 
 import {styles} from './styles';
-
-// const users = [
-//     {name: 'D', active: true},
-//     {name: 'L B'},
-//     {name: 'L M'},
-//     {name: 'D D D'},
-//     {name: 'X X X'},
-//     {name: 'T G'},
-// ]
 
 const config = {
     iceServers: [
@@ -32,36 +22,6 @@ const config = {
     ],
 };
 
-function handleCreateOfferError(event) {
-    console.warn('createOffer() error: ', event);
-}
-
-function onCreateSessionDescriptionError(error) {
-    console.warn('Failed to create session description: ' + error.toString());
-}
-
-async function getLocalStream (setStream, start) {
-    const availableDevices = await mediaDevices.enumerateDevices();
-    const {deviceId: sourceId} = availableDevices.find(
-      device => device.kind === 'videoinput' && device.facing === 'front',
-    );
-
-    const streamBuffer = await mediaDevices.getUserMedia({
-      audio: true,
-      video: {
-        mandatory: {
-          minWidth: 500,
-          minHeight: 300,
-          minFrameRate: 30,
-        },
-        facingMode: 'user',
-        optional: [{sourceId}],
-      },
-    });
-    setStream(streamBuffer);
-    start();
-    return streamBuffer;
-}
 
 const host = true ? 'https://webrtc-google-demo.herokuapp.com' : 'http://localhost:4000';
 
@@ -73,25 +33,69 @@ const mySocket = io(host, {
 
 });
 
-// mySocket.connect();
+const messageTypes = {
+    offer: 'offer',
+    answer: 'answer',
+    candidate: 'candidate',
+    close: 'close',
+};
 
-console.warn("socket", mySocket)
+const handleError = (e) => {
+    console.warn(e);
+}
 
 const Room = ({route: { params = {}} = {}}) => {
-    // console.warn(props);
     const [socket] = useState(mySocket);
     const [uniqueId] = useState(uuid());
     const [localStream, setLocalStream] = useState(null);
     const [remotesStreams, setRemoteStreams] = useState([]);
     const peerConnections = useRef(new Map());
+    const [isInitPeerConnection, setInitPeerConnection] = useState(false);
+
+    useEffect(()=> {
+        getLocalStream();
+        initSocket();
+
+        return () => {
+            sendMessage({uniqueId, message: {type: 'close'}});
+            disconnect();
+        }
+    }, []);
 
     useEffect(()=>{
+        if(localStream && !isInitPeerConnection) {
+            initPeerConnection();
+            setInitPeerConnection(true);
+        }
+    },[localStream])
+
+    const getLocalStream = () => {
+        mediaDevices.enumerateDevices().then(availableDevices => {
+            const {deviceId: sourceId} = availableDevices.find(
+              device => device.kind === 'videoinput' && device.facing === 'front',
+            );
+            mediaDevices.getUserMedia({
+              audio: true,
+              video: {
+                mandatory: {
+                  minWidth: 500,
+                  minHeight: 300,
+                  minFrameRate: 30,
+                },
+                facingMode: 'user',
+                optional: [{sourceId}],
+              },
+            }).then(streamBuffer => {
+                setLocalStream(streamBuffer);
+            });
+        });
+    };
+
+    const initSocket = () => {
         if(!socket.connected) {
             socket.connect();
         }
-        getLocalStream(setLocalStream, maybeStart);
         const room = params.room || 'foo';
-        console.warn("room", params.room )
         if (room !== '') {
             socket.emit('create or join', room);
             console.warn('Attempted to create or  join room', room);
@@ -103,69 +107,142 @@ const Room = ({route: { params = {}} = {}}) => {
           
         socket.on('created', function(room) {
             console.warn('Created room ' + room);
-        // isInitiator = true;
         });
         
         socket.on('full', function(room) {
             console.warn('Room ' + room + ' is full');
         });
         
-        socket.on('join', function (room){
-            console.warn('Another peer made a request to join room ' + room);
-            console.warn('This peer is the initiator of room ' + room + '!');
-            createdOffer();
-            // isChannelReady = true;
+        socket.on('join', function(room) {
+            console.warn("join");
+            createOffer();
         });
         
         socket.on('joined', function(room) {
             console.warn('joined: ' + room);
-            // isChannelReady = true;
         });
 
         socket.on('message', function(fullMesage) {
             const {uniqueId: messageId, message} = fullMesage;
-            if(!(uniqueId === messageId) && typeof message === 'object') {
-                let connectionBuffer = peerConnections.current.get(uniqueId);
-                console.warn('Client received message:', message);
-                if (message.type === 'offer') {
-                    if (!connectionBuffer) {
-                        maybeStart();
-                    }
-                    connectionBuffer = peerConnections.current.get(uniqueId);
-                    connectionBuffer.setRemoteDescription(new RTCSessionDescription(message));
-                    connectionBuffer.createAnswer().then(
-                        setLocalAndSendMessage,
-                        onCreateSessionDescriptionError
-                    );
-                } else if (message.type === 'answer') {
-                    connectionBuffer.setRemoteDescription(new RTCSessionDescription(message));
-                } else if (message.type === 'candidate') {
-                    var candidate = new RTCIceCandidate({
-                        sdpMLineIndex: message.label,
-                        candidate: message.candidate
-                    });
-                    connectionBuffer.addIceCandidate(candidate);
-                } else if (message.type === 'close') {
-                    console.warn('Session terminated.');
-                    // isStarted = false;
-                    connectionBuffer.close();
-                    peerConnections.current.set(uniqueId, null);
-                    // isInitiator = false;
+            if(messageId !== uniqueId) {
+                switch(message.type) {
+                    case messageTypes.offer:
+                        messageOffer(message);
+                        break;
+                    case messageTypes.answer:
+                        messageAnswer(message);
+                        break;
+                    case messageTypes.candidate:
+                        messageCandidate(message);
+                        break;
+                    case messageTypes.close:
+                        console.warn('close');
+                        disconnect(messageId);
+                        break;
+                    default:
+                        console.warn('messagem desconhecida', message.type);
                 }
             }
         });
+    }
 
-        return () => {
-            let connectionBuffer = peerConnections.current.get(uniqueId);
-            if(connectionBuffer) {
-                connectionBuffer.close();
-                peerConnections.current.set(uniqueId, null);
-                sendMessage({uniqueId, message: {type: 'close'}});
-            }
+    const disconnect = (messageId = null) => {
+        let connectionBuffer = peerConnections.current.get(uniqueId);
+        if(connectionBuffer && messageId) {
+            const [remoteStream] = connectionBuffer.getRemoteStreams();
+            const id = remoteStream.id;
+            setRemoteStreams(state => state.filter(e => e.id !== id));
+        }
+        connectionBuffer.close();
+        peerConnections.current.delete(uniqueId);
+        if(socket.connected && !messageId){
             socket.close();
         }
-    },[]);
+    }
 
+    const checkPeerConnection = () => {
+        let connectionBuffer = peerConnections.current.get(uniqueId);
+        console.warn('Boolean(connectionBuffer);', Boolean(connectionBuffer));
+        return Boolean(connectionBuffer);
+    }
+
+    const initPeerConnection = (callback) => {
+        const connectionBuffer = new RTCPeerConnection(config);
+        connectionBuffer.addStream(localStream);
+        connectionBuffer.onicecandidate = (event) => {
+            if (event.candidate) {
+                sendMessage({
+                    uniqueId,
+                    message: {
+                        type: messageTypes.candidate,
+                        candidate: event.candidate,
+                    }
+                });
+            }
+        };
+        connectionBuffer.onaddstream = (event) => {
+            setRemoteStreams(state => [...state, event.stream]);
+        };
+        connectionBuffer.onremovestream = (event) => {
+            const id = event.stream.id;
+            setRemoteStreams(state => state.filter(e => e.id !== id));
+        };
+        peerConnections.current.set(uniqueId, connectionBuffer);
+        console.warn('Created RTCPeerConnnection');
+        callback && callback()
+    }
+
+    const messageCandidate = (message) => {
+        peerConnections.current
+            .get(uniqueId)
+            .addIceCandidate(message.candidate)
+            .then(e => console.warn(e));
+    }
+
+    const messageAnswer = (message) => {
+        peerConnections.current
+            .get(uniqueId)
+            .setRemoteDescription(new RTCSessionDescription(message));
+    }
+
+    const messageOffer = (message) => {
+        const pc = peerConnections.current.get(uniqueId);
+        pc.setRemoteDescription(new RTCSessionDescription(message))
+            .then(createAnswer)
+            .then(setDescription)
+            .then(sendDescription)
+            .catch(handleError);
+    }
+
+    const createAnswer = () => {
+        const pc = peerConnections.current.get(uniqueId);
+        return pc.createAnswer();
+    }
+
+    const setDescription = (offer) => {
+        const pc = peerConnections.current.get(uniqueId);
+        return pc.setLocalDescription(offer);
+    }
+
+    const sendDescription = () => {
+        const pc = peerConnections.current.get(uniqueId);
+        sendMessage({ uniqueId, message: pc.localDescription});
+    }
+
+    const createOffer = () => {
+        if(params.isCreated) {
+            const pc = peerConnections.current.get(uniqueId);
+            pc.createOffer()
+                .then(setDescription)
+                .then(sendDescription)
+                .catch(handleError);
+        }
+    }
+
+    const sendMessage = (message) => {
+        console.warn('Client sending message: ', message);
+        socket.emit('message', message);
+    }
 
     const users = useMemo(()=> {
         return [
@@ -179,72 +256,13 @@ const Room = ({route: { params = {}} = {}}) => {
         ];
     },[localStream, remotesStreams]);
 
-    const maybeStart = () => {
-        if(localStream) {
-            try {
-                const connectionBuffer = new RTCPeerConnection(config);
-                connectionBuffer.onicecandidate = handleIceCandidate;
-                connectionBuffer.onaddstream = handleRemoteStreamAdded;
-                connectionBuffer.onremovestream = handleRemoteStreamRemoved;
-                peerConnections.current.set(uniqueId, connectionBuffer);
-                console.warn('Created RTCPeerConnnection');
-            } catch (e) {
-                console.warn('Failed to create PeerConnection, exception: ' + e.message);
-                alert('Cannot create RTCPeerConnection object.');
-            }
-            const connectionBuffer = peerConnections.current.get(uniqueId);
-            connectionBuffer.addStream(localStream);
-        }
-    }
-
-    const createdOffer = () => {
-        let connectionBuffer = peerConnections.current.get(uniqueId);
-        if(params.isCreated && connectionBuffer) { //se eu que criei a sala
-            connectionBuffer.createOffer(setLocalAndSendMessage, handleCreateOfferError);
-        }
-    }
-
-    function sendMessage(message) {
-        console.warn('Client sending message: ', message);
-        socket.emit('message', message);
-    }
-
-    const setLocalAndSendMessage = (sessionDescription) => {
-        const connectionBuffer = peerConnections.current.get(uniqueId);
-        connectionBuffer.setLocalDescription(sessionDescription);
-        console.warn('setLocalAndSendMessage sending message', sessionDescription);
-        sendMessage({message: sessionDescription, uniqueId});
-    }
-    const handleRemoteStreamAdded = (event) => {
-        console.warn('Remote stream added.');
-        remoteStream = event.stream;
-        setRemoteStreams(state => [...state, remoteStream]); //verificar se já não ta
-    }
-      
-    const handleRemoteStreamRemoved = (event) => {
-        console.warn('Remote stream removed. Event: ', event); //remover do array de remotesStreams
-    }
-
-    const handleIceCandidate = (event) => {
-        console.warn('icecandidate event: ', event);
-        if (event.candidate) {
-            sendMessage({ uniqueId, message: {
-                type: 'candidate',
-                label: event.candidate.sdpMLineIndex,
-                id: event.candidate.sdpMid,
-                candidate: event.candidate.candidate
-            }});
-        } else {
-            console.warn('End of candidates.');
-        }
-    }
-
     const renderItems = ({item}) => {
         if(item.stream) {
             return <WebrtcView {...item}/>
         }
         return <Participant {...item}/>
     }
+
     return (
         <View style={styles.Container} >
             <FlatList
