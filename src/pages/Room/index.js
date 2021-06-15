@@ -50,11 +50,13 @@ const Room = ({route: { params = {}} = {}}) => {
     const [localStream, setLocalStream] = useState(null);
     const [remotesStreams, setRemoteStreams] = useState([]);
     const peerConnections = useRef(new Map());
-    const [isInitPeerConnection, setInitPeerConnection] = useState(false);
+    const [initsPeerConnections, setInitPeerConnection] = useState([]);
+    const [initsPeerConnectionsOffer, setInitPeerConnectionOffer] = useState([]);
+    const [initsPeerConnectionsCandidate, setInitPeerConnectionCandidate] = useState([]);
 
     useEffect(()=> {
-        getLocalStream();
-        initSocket();
+        getLocalStream(initSocket);
+        // initSocket();
 
         return () => {
             sendMessage({uniqueId, message: {type: 'close'}});
@@ -63,13 +65,48 @@ const Room = ({route: { params = {}} = {}}) => {
     }, []);
 
     useEffect(()=>{
-        if(localStream && !isInitPeerConnection) {
-            initPeerConnection();
-            setInitPeerConnection(true);
+        if(localStream) {
+            for (const peer of initsPeerConnections) {
+                let pc = peerConnections.current.get(peer);
+                if(!pc) {
+                    console.warn('create offer')
+                    initPeerConnection({id: peer, callback: () => createOffer(peer)});
+                    // createOffer(peer);
+                }
+            }
         }
-    },[localStream])
+    },[localStream, initsPeerConnections]);
 
-    const getLocalStream = () => {
+    useEffect(()=>{
+        if(localStream) {
+            for (const peer of initsPeerConnectionsOffer) {
+                let pc = peerConnections.current.get(peer.id);
+                if(!pc) {
+                    console.warn('recebi offer')
+                    initPeerConnection({id: peer.id, callback: () => messageOffer(peer.message, peer.id)});
+                } else {
+                    messageOffer(peer.message, peer.id);
+                }
+            }
+        }
+    },[localStream, initsPeerConnectionsOffer])
+
+    useEffect(()=>{
+        if(localStream) {
+            for (const peer of initsPeerConnectionsOffer) {
+                let pc = peerConnections.current.get(peer.id);
+                if(!pc) {
+                    console.warn('recebi candidate')
+                    initPeerConnection({id: peer.id, callback: () => messageCandidate(peer.message, peer.id)});
+                    // messageOffer(peer.message, peer.id);
+                } else {
+                    messageCandidate(peer.message, peer.id);
+                }
+            }
+        }
+    },[localStream, initsPeerConnectionsCandidate])
+
+    const getLocalStream = (callback) => {
         mediaDevices.enumerateDevices().then(availableDevices => {
             const {deviceId: sourceId} = availableDevices.find(
               device => device.kind === 'videoinput' && device.facing === 'front',
@@ -87,6 +124,8 @@ const Room = ({route: { params = {}} = {}}) => {
               },
             }).then(streamBuffer => {
                 setLocalStream(streamBuffer);
+                console.warn('teste')
+                callback && callback();
             });
         });
     };
@@ -97,7 +136,7 @@ const Room = ({route: { params = {}} = {}}) => {
         }
         const room = params.room || 'foo';
         if (room !== '') {
-            socket.emit('create or join', room);
+            socket.emit('create or join', {room, uniqueId});
             console.warn('Attempted to create or  join room', room);
         }
 
@@ -113,9 +152,11 @@ const Room = ({route: { params = {}} = {}}) => {
             console.warn('Room ' + room + ' is full');
         });
         
-        socket.on('join', function(room) {
+        socket.on('join', function({room, uniqueId: id}) {
             console.warn("join");
-            createOffer();
+            // initPeerConnection({id});
+            setInitPeerConnection(state => [...state, id]);
+            // createOffer(id);
         });
         
         socket.on('joined', function(room) {
@@ -123,17 +164,31 @@ const Room = ({route: { params = {}} = {}}) => {
         });
 
         socket.on('message', function(fullMesage) {
-            const {uniqueId: messageId, message} = fullMesage;
+            const {uniqueId: messageId, message, received_by} = fullMesage;
             if(messageId !== uniqueId) {
                 switch(message.type) {
                     case messageTypes.offer:
-                        messageOffer(message);
+                        if(!peerConnections.current.get(messageId)){
+                            console.warn('vou criar outra connexão', !peerConnections.current.get(messageId))
+                            // initPeerConnection({id: messageId});
+                            setInitPeerConnectionOffer(state => [{ id: messageId, message }]);
+                        } else {
+                            messageOffer(message, messageId);
+                        }
                         break;
                     case messageTypes.answer:
-                        messageAnswer(message);
+                        if(uniqueId === received_by) {
+                            messageAnswer(message, messageId);
+                        }
                         break;
                     case messageTypes.candidate:
-                        messageCandidate(message);
+                        if(uniqueId === received_by) {
+                            if(!peerConnections.current.get(messageId)) {
+                                setInitPeerConnectionCandidate(state => [{ id: messageId, message }]);
+                            } else {
+                                messageCandidate(message, messageId);
+                            }
+                        }
                         break;
                     case messageTypes.close:
                         console.warn('close');
@@ -147,14 +202,16 @@ const Room = ({route: { params = {}} = {}}) => {
     }
 
     const disconnect = (messageId = null) => {
-        let connectionBuffer = peerConnections.current.get(uniqueId);
-        if(connectionBuffer && messageId) {
-            const [remoteStream] = connectionBuffer.getRemoteStreams();
-            const id = remoteStream.id;
-            setRemoteStreams(state => state.filter(e => e.id !== id));
+        if(messageId) {
+            let connectionBuffer = peerConnections.current.get(messageId);
+            if(connectionBuffer) {
+                const [remoteStream] = connectionBuffer.getRemoteStreams();
+                const id = remoteStream.id;
+                setRemoteStreams(state => state.filter(e => e.id !== id));
+                connectionBuffer.close();
+                peerConnections.current.delete(messageId);
+            }
         }
-        connectionBuffer.close();
-        peerConnections.current.delete(uniqueId);
         if(socket.connected && !messageId){
             socket.close();
         }
@@ -166,13 +223,14 @@ const Room = ({route: { params = {}} = {}}) => {
         return Boolean(connectionBuffer);
     }
 
-    const initPeerConnection = (callback) => {
+    const initPeerConnection = ({id, callback}) => {
         const connectionBuffer = new RTCPeerConnection(config);
         connectionBuffer.addStream(localStream);
         connectionBuffer.onicecandidate = (event) => {
             if (event.candidate) {
                 sendMessage({
                     uniqueId,
+                    received_by: id,
                     message: {
                         type: messageTypes.candidate,
                         candidate: event.candidate,
@@ -187,56 +245,54 @@ const Room = ({route: { params = {}} = {}}) => {
             const id = event.stream.id;
             setRemoteStreams(state => state.filter(e => e.id !== id));
         };
-        peerConnections.current.set(uniqueId, connectionBuffer);
+        peerConnections.current.set(id, connectionBuffer);
         console.warn('Created RTCPeerConnnection');
         callback && callback()
     }
 
-    const messageCandidate = (message) => {
+    const messageCandidate = (message, id) => {
         peerConnections.current
-            .get(uniqueId)
+            .get(id)
             .addIceCandidate(message.candidate)
             .then(e => console.warn(e));
     }
 
-    const messageAnswer = (message) => {
+    const messageAnswer = (message, id) => {
         peerConnections.current
-            .get(uniqueId)
+            .get(id)
             .setRemoteDescription(new RTCSessionDescription(message));
     }
 
-    const messageOffer = (message) => {
-        const pc = peerConnections.current.get(uniqueId);
+    const messageOffer = (message, id) => {
+        const pc = peerConnections.current.get(id);
         pc.setRemoteDescription(new RTCSessionDescription(message))
-            .then(createAnswer)
-            .then(setDescription)
-            .then(sendDescription)
+            .then(()=> createAnswer(id))
+            .then((e) => setDescription(e, id))
+            .then(() => sendDescription(id))
             .catch(handleError);
     }
 
-    const createAnswer = () => {
-        const pc = peerConnections.current.get(uniqueId);
+    const createAnswer = (id) => {
+        const pc = peerConnections.current.get(id);
         return pc.createAnswer();
     }
 
-    const setDescription = (offer) => {
-        const pc = peerConnections.current.get(uniqueId);
+    const setDescription = (offer, id) => {
+        const pc = peerConnections.current.get(id);
         return pc.setLocalDescription(offer);
     }
 
-    const sendDescription = () => {
-        const pc = peerConnections.current.get(uniqueId);
-        sendMessage({ uniqueId, message: pc.localDescription});
+    const sendDescription = (id) => {
+        const pc = peerConnections.current.get(id);
+        sendMessage({ uniqueId, received_by: id, message: pc.localDescription});
     }
 
-    const createOffer = () => {
-        if(params.isCreated) {
-            const pc = peerConnections.current.get(uniqueId);
-            pc.createOffer()
-                .then(setDescription)
-                .then(sendDescription)
-                .catch(handleError);
-        }
+    const createOffer = (id) => {
+        const pc = peerConnections.current.get(id);
+        pc.createOffer()
+            .then((e)=>setDescription(e, id))
+            .then((e)=> sendDescription(id))
+            .catch(handleError);
     }
 
     const sendMessage = (message) => {
